@@ -42,6 +42,19 @@ class ChannelReaper():
             keywords = keywords + whitelist_keywords.split(',')
         return list(keywords)
 
+    def get_blacklist_channels(self):
+        """
+        Channels in blacklist.txt would be archived regardless of its state
+        """
+        keywords = []
+        if os.path.isfile('blacklist.txt'):
+            with open('blacklist.txt') as filecontent:
+                keywords = filecontent.readlines()
+
+        # remove whitespace characters like `\n` at the end of each line
+        keywords = map(lambda x: x.strip(), keywords)
+        return list(keywords)
+
     def get_channel_alerts(self):
         """Get the alert message which is used to notify users in a channel of archival. """
         archive_msg = """
@@ -68,7 +81,7 @@ This script was run from this repo: https://github.com/Symantec/slack-autoarchiv
         """ Helper function to query the slack api and handle errors and rate limit. """
         # pylint: disable=no-member
         uri = 'https://slack.com/api/' + api_endpoint
-        payload['token'] = self.settings.get('slack_token')
+        headers = {'Authorization': 'Bearer ' + self.settings.get('slack_token')}
         try:
             # Force request to take at least 1 second. Slack docs state:
             # > In general we allow applications that integrate with Slack to send
@@ -78,16 +91,28 @@ This script was run from this repo: https://github.com/Symantec/slack-autoarchiv
                 time.sleep(retry_delay)
 
             if method == 'POST':
-                response = requests.post(uri, data=payload)
+                response = requests.post(uri, json=payload, headers=headers)
             else:
-                response = requests.get(uri, params=payload)
+                response = requests.get(uri, params=payload, headers=headers)
 
             if response.status_code == requests.codes.ok and 'error' in response.json(
-            ) and response.json()['error'] == 'not_authed':
-                self.logger.error(
-                    'Need to setup auth. eg, SLACK_TOKEN=<secret token> python slack-autoarchive.py'
-                )
-                sys.exit(1)
+            ):
+                if response.json()['error'] == 'not_authed':
+                    self.logger.error(
+                        'Need to setup auth. eg, SLACK_TOKEN=<secret token> python slack-autoarchive.py'
+                    )
+                    sys.exit(1)
+                elif response.json()['error'] == 'not_in_channel':
+                    self.logger.error(
+                        'Need to add bot to channel described by ' + str(payload)
+                    )
+                    self.join_channel(payload['channel'])
+                    return response.json()
+                else:
+                    self.logger.error(
+                        response.json()['error']
+                    )
+                    sys.exit(1)
             elif response.status_code == requests.codes.ok and response.json(
             )['ok']:
                 return response.json()
@@ -100,20 +125,44 @@ This script was run from this repo: https://github.com/Symantec/slack-autoarchiv
             raise Exception(error_msg)
         return None
 
+    def join_channel(self, channel_id):
+        api_endpoint = 'conversations.join'
+        info_payload = {'channel': channel_id}
+        channel_info = self.slack_api_http(api_endpoint=api_endpoint,
+                                           payload=info_payload,
+                                           method='POST')
+        self.logger.info('Joined channel ' + channel_id)
+
     def get_all_channels(self):
         """ Get a list of all non-archived channels from slack channels.list. """
-        payload = {'exclude_archived': 1}
-        api_endpoint = 'channels.list'
-        channels = self.slack_api_http(api_endpoint=api_endpoint,
-                                       payload=payload)['channels']
+        payload = {'exclude_archived':1, 'limit':100}
+        api_endpoint = 'conversations.list'
+
+        flag_first_page = True
+        flag_last_page = False
+        next_cursor = ''
         all_channels = []
-        for channel in channels:
-            all_channels.append({
-                'id': channel['id'],
-                'name': channel['name'],
-                'created': channel['created'],
-                'num_members': channel['num_members']
-            })
+        while not flag_last_page:
+            if not flag_first_page:
+                payload['cursor']  = next_cursor
+            api_response = self.slack_api_http(api_endpoint=api_endpoint, payload=payload)
+            if flag_first_page:
+                flag_first_page = False
+
+            channels = api_response['channels']
+            self.logger.info('%s channel(s) retrieved' % str(len(channels)))
+            for channel in channels:
+                all_channels.append({
+                    'id': channel['id'],
+                    'name': channel['name'],
+                    'created': channel['created'],
+                    'num_members': channel['num_members']
+                })
+
+            next_cursor = api_response['response_metadata'].get('next_cursor')
+            if not next_cursor:
+                flag_last_page = True
+
         return all_channels
 
     def get_last_message_timestamp(self, channel_history, too_old_datetime):
@@ -144,7 +193,7 @@ This script was run from this repo: https://github.com/Symantec/slack-autoarchiv
         """ Return True or False depending on if a channel is "active" or not.  """
         num_members = channel['num_members']
         payload = {'inclusive': 0, 'oldest': 0, 'count': 50}
-        api_endpoint = 'channels.history'
+        api_endpoint = 'conversations.history'
 
         payload['channel'] = channel['id']
         channel_history = self.slack_api_http(api_endpoint=api_endpoint,
@@ -165,7 +214,7 @@ This script was run from this repo: https://github.com/Symantec/slack-autoarchiv
         # self.settings.get('skip_channel_str')
         # if the channel purpose contains the string self.settings.get('skip_channel_str'), we'll skip it.
         info_payload = {'channel': channel['id']}
-        channel_info = self.slack_api_http(api_endpoint='channels.info',
+        channel_info = self.slack_api_http(api_endpoint='conversations.info',
                                            payload=info_payload,
                                            method='GET')
         channel_purpose = channel_info['channel']['purpose']['value']
@@ -182,6 +231,12 @@ This script was run from this repo: https://github.com/Symantec/slack-autoarchiv
                 return True
         return False
 
+    def is_channel_blacklisted(self, channel, black_listed_channels):
+        """ Return True of False depending on whether the channel is on the provided list. """
+        return any(channel == item for item in black_listed_channels)
+
+
+
     def send_channel_message(self, channel_id, message):
         """ Send a message to a channel or user. """
         payload = {
@@ -197,7 +252,7 @@ This script was run from this repo: https://github.com/Symantec/slack-autoarchiv
 
     def archive_channel(self, channel, alert):
         """ Archive a channel, and send alert to slack admins. """
-        api_endpoint = 'channels.archive'
+        api_endpoint = 'conversations.archive'
         stdout_message = 'Archiving channel... %s' % channel['name']
         self.logger.info(stdout_message)
 
@@ -205,7 +260,7 @@ This script was run from this repo: https://github.com/Symantec/slack-autoarchiv
             channel_message = alert.format(self.settings.get('days_inactive'))
             self.send_channel_message(channel['id'], channel_message)
             payload = {'channel': channel['id']}
-            self.slack_api_http(api_endpoint=api_endpoint, payload=payload)
+            self.slack_api_http(api_endpoint=api_endpoint, payload=payload, method='POST')
             self.logger.info(stdout_message)
 
     def send_admin_report(self, channels):
@@ -229,6 +284,7 @@ This script was run from this repo: https://github.com/Symantec/slack-autoarchiv
                 'THIS IS A DRY RUN. NO CHANNELS ARE ACTUALLY ARCHIVED.')
 
         whitelist_keywords = self.get_whitelist_keywords()
+        blacklist_channels = self.get_blacklist_channels()
         alert_templates = self.get_channel_alerts()
         archived_channels = []
 
@@ -236,11 +292,13 @@ This script was run from this repo: https://github.com/Symantec/slack-autoarchiv
             sys.stdout.write('.')
             sys.stdout.flush()
 
+            channel_blacklisted = self.is_channel_blacklisted(
+                channel, blacklist_channels)
             channel_whitelisted = self.is_channel_whitelisted(
                 channel, whitelist_keywords)
             channel_disused = self.is_channel_disused(
                 channel, self.settings.get('too_old_datetime'))
-            if (not channel_whitelisted and channel_disused):
+            if (channel_blacklisted or (not channel_whitelisted and channel_disused)):
                 archived_channels.append(channel)
                 self.archive_channel(channel,
                                      alert_templates['channel_template'])
